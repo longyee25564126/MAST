@@ -179,6 +179,8 @@ class MAST(nn.Module):
         self.aux_loss = aux_loss
         self.only_detr = only_detr
         self.d_model = d_model
+        # For runtime_tracker compatibility (used in inference)
+        self.num_id_vocabulary = 1000  # placeholder; not used in MAST's assignment-based tracking
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -275,6 +277,7 @@ class MAST(nn.Module):
             )
             out = self._compute_detections(hs, init_reference, inter_references)
             out["detect_outputs"] = hs[-1]
+            out["outputs"] = hs[-1]  # backward compat with train.py
             out["track_outputs"] = None
             out["assignment_logits"] = None
 
@@ -295,6 +298,7 @@ class MAST(nn.Module):
 
             out = self._compute_detections(detect_hs, init_reference, inter_references)
             out["detect_outputs"] = detect_hs[-1]
+            out["outputs"] = detect_hs[-1]  # backward compat with train.py
             out["track_outputs"] = track_output
 
             if track_queries is not None and track_queries.shape[1] > 0:
@@ -487,6 +491,28 @@ def build(config: dict):
         only_detr=only_detr,
         d_model=d_model,
     )
+
+    # Init MAST-specific parameters with xavier_uniform_ (consistent with DETR)
+    if not only_detr:
+        for p in model.mast_decoder.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+        for m in model.mast_decoder.modules():
+            if isinstance(m, MSDeformAttn):
+                m._reset_parameters()
+        for p in model.assignment_head.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+        for p in model.init_mlp.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+        for p in model.tia.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+        # Freeze std_decoder: kept only for pretrained weight key compatibility
+        for p in model.detr.transformer.decoder.parameters():
+            p.requires_grad_(False)
 
     # ── 10. Criterion ─────────────────────────────────────────────────────────
     matcher = HungarianMatcher(

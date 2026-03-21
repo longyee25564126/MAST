@@ -19,6 +19,7 @@ from utils import box_ops
 from utils.nested_tensor import nested_tensor_from_tensor_list
 from models.misc import accuracy, interpolate, inverse_sigmoid
 from utils.misc import is_distributed, distributed_world_size
+from utils.train_utils import batch_iterator, tensor_dict_index_select
 
 
 # ─── Loss helpers ─────────────────────────────────────────────────────────────
@@ -167,7 +168,6 @@ class SetCriterion(nn.Module):
             list(range(len(targets))), dtype=torch.int64,
             device=outputs['pred_logits'].device,
         )
-        from train import batch_iterator, tensor_dict_index_select
         for batch_iter_idxs, batch_targets, batch_indices in batch_iterator(
             batch_len, iter_idxs, targets, indices
         ):
@@ -193,7 +193,6 @@ class SetCriterion(nn.Module):
                 list(range(len(targets))), dtype=torch.int64,
                 device=outputs_without_aux['pred_logits'].device,
             )
-            from train import batch_iterator, tensor_dict_index_select
             for batch_iter_idxs, batch_targets in batch_iterator(
                 kwargs["batch_len"], iter_idxs, targets
             ):

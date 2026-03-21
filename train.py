@@ -26,6 +26,7 @@ from log.log import TPS, Metrics
 from models.misc import load_detr_pretrain, save_checkpoint, load_checkpoint
 from models.misc import get_model
 from utils.nested_tensor import NestedTensor
+from utils.train_utils import batch_iterator, tensor_dict_index_select
 from submit_and_evaluate import submit_and_evaluate_one_model
 
 
@@ -606,15 +607,6 @@ def nested_tensor_index_select(nested_tensor: NestedTensor, dim: int, index: tor
     return NestedTensor(tensors=selected_tensors, mask=selected_mask)
 
 
-def batch_iterator(batch_size: int, *args) -> Generator[List[Any], None, None]:
-    assert len(args) > 0 and all(
-        len(a) == len(args[0]) for a in args
-    ), "Batched iteration must have inputs of all the same size."
-    n_batches = len(args[0]) // batch_size + int(len(args[0]) % batch_size != 0)
-    for b in range(n_batches):
-        yield [arg[b * batch_size: (b + 1) * batch_size] for arg in args]
-
-
 def tensor_dict_cat(tensor_dict1, tensor_dict2, dim=0):
     if tensor_dict1 is None or tensor_dict2 is None:
         assert tensor_dict1 is not None or tensor_dict2 is not None, "One of the tensor dict should be not None."
@@ -636,22 +628,6 @@ def tensor_dict_cat(tensor_dict1, tensor_dict2, dim=0):
                 raise ValueError(f"Unsupported type {type(tensor_dict1[k])} in the tensor dict concat.")
         return dict(res_tensor_dict)
 
-
-def tensor_dict_index_select(tensor_dict, index, dim=0):
-    res_tensor_dict = defaultdict()
-    for k in tensor_dict.keys():
-        if isinstance(tensor_dict[k], torch.Tensor):
-            res_tensor_dict[k] = torch.index_select(tensor_dict[k], index=index, dim=dim).contiguous()
-        elif isinstance(tensor_dict[k], dict):
-            res_tensor_dict[k] = tensor_dict_index_select(tensor_dict[k], index=index, dim=dim)
-        elif isinstance(tensor_dict[k], list):
-            res_tensor_dict[k] = [
-                tensor_dict_index_select(tensor_dict[k][_], index=index, dim=dim)
-                for _ in range(len(tensor_dict[k]))
-            ]
-        else:
-            raise ValueError(f"Unsupported type {type(tensor_dict[k])} in the tensor dict index select.")
-    return dict(res_tensor_dict)
 
 
 def prepare_for_motip(detr_outputs, annotations, detr_indices):
