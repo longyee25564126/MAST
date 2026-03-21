@@ -69,45 +69,46 @@ def collate_fn(batch):
     )
     # Above is prepared for DETR.
     # Below is prepared for MOTIP, pre-padding the annotations:
-    max_N = max(annotation[0]["trajectory_id_labels"].shape[-1] for annotation in annotations)
-    # Padding the ID annotations:
-    for b in range(len(annotations)):
-        for t in range(len(annotations[b])):
-            _G, _, _N = annotations[b][t]["trajectory_id_labels"].shape
-            if _N < max_N:
-                annotations[b][t]["trajectory_id_labels"] = torch.cat([
-                    annotations[b][t]["trajectory_id_labels"],
-                    - torch.ones((_G, 1, max_N - _N), dtype=torch.int64)
-                ], dim=-1)
-                annotations[b][t]["trajectory_id_masks"] = torch.cat([
-                    annotations[b][t]["trajectory_id_masks"],
-                    torch.ones((_G, 1, max_N - _N), dtype=torch.bool)
-                ], dim=-1)
-                annotations[b][t]["trajectory_ann_idxs"] = torch.cat([
-                    annotations[b][t]["trajectory_ann_idxs"],
-                    - torch.ones((_G, 1, max_N - _N), dtype=torch.int64)
-                ], dim=-1)
-                annotations[b][t]["trajectory_times"] = torch.cat([
-                    annotations[b][t]["trajectory_times"],
-                    t * torch.ones((_G, 1, max_N - _N), dtype=torch.int64)
-                ], dim=-1)
-                annotations[b][t]["unknown_id_labels"] = torch.cat([
-                    annotations[b][t]["unknown_id_labels"],
-                    - torch.ones((_G, 1, max_N - _N), dtype=torch.int64)
-                ], dim=-1)
-                annotations[b][t]["unknown_id_masks"] = torch.cat([
-                    annotations[b][t]["unknown_id_masks"],
-                    torch.ones((_G, 1, max_N - _N), dtype=torch.bool)
-                ], dim=-1)
-                annotations[b][t]["unknown_ann_idxs"] = torch.cat([
-                    annotations[b][t]["unknown_ann_idxs"],
-                    - torch.ones((_G, 1, max_N - _N), dtype=torch.int64)
-                ], dim=-1)
-                annotations[b][t]["unknown_times"] = torch.cat([
-                    annotations[b][t]["unknown_times"],
-                    t * torch.ones((_G, 1, max_N - _N), dtype=torch.int64)
-                ], dim=-1)
-            pass
+    if "trajectory_id_labels" in annotations[0][0]:
+        max_N = max(annotation[0]["trajectory_id_labels"].shape[-1] for annotation in annotations)
+        # Padding the ID annotations:
+        for b in range(len(annotations)):
+            for t in range(len(annotations[b])):
+                _G, _, _N = annotations[b][t]["trajectory_id_labels"].shape
+                if _N < max_N:
+                    annotations[b][t]["trajectory_id_labels"] = torch.cat([
+                        annotations[b][t]["trajectory_id_labels"],
+                        - torch.ones((_G, 1, max_N - _N), dtype=torch.int64)
+                    ], dim=-1)
+                    annotations[b][t]["trajectory_id_masks"] = torch.cat([
+                        annotations[b][t]["trajectory_id_masks"],
+                        torch.ones((_G, 1, max_N - _N), dtype=torch.bool)
+                    ], dim=-1)
+                    annotations[b][t]["trajectory_ann_idxs"] = torch.cat([
+                        annotations[b][t]["trajectory_ann_idxs"],
+                        - torch.ones((_G, 1, max_N - _N), dtype=torch.int64)
+                    ], dim=-1)
+                    annotations[b][t]["trajectory_times"] = torch.cat([
+                        annotations[b][t]["trajectory_times"],
+                        t * torch.ones((_G, 1, max_N - _N), dtype=torch.int64)
+                    ], dim=-1)
+                    annotations[b][t]["unknown_id_labels"] = torch.cat([
+                        annotations[b][t]["unknown_id_labels"],
+                        - torch.ones((_G, 1, max_N - _N), dtype=torch.int64)
+                    ], dim=-1)
+                    annotations[b][t]["unknown_id_masks"] = torch.cat([
+                        annotations[b][t]["unknown_id_masks"],
+                        torch.ones((_G, 1, max_N - _N), dtype=torch.bool)
+                    ], dim=-1)
+                    annotations[b][t]["unknown_ann_idxs"] = torch.cat([
+                        annotations[b][t]["unknown_ann_idxs"],
+                        - torch.ones((_G, 1, max_N - _N), dtype=torch.int64)
+                    ], dim=-1)
+                    annotations[b][t]["unknown_times"] = torch.cat([
+                        annotations[b][t]["unknown_times"],
+                        t * torch.ones((_G, 1, max_N - _N), dtype=torch.int64)
+                    ], dim=-1)
+                pass
     return {
         "images": nested_tensor,
         "annotations": annotations,

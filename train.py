@@ -3,6 +3,7 @@
 import os
 import math
 import torch
+import torch.nn.functional as F
 import einops
 from accelerate import Accelerator
 from accelerate.state import PartialState
@@ -11,10 +12,8 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import MultiStepLR
 from collections import defaultdict
 from torchvision.transforms import v2
-from typing import Any, Generator, List
 
-from models.motip import build as build_motip
-from models.motip.id_criterion import build as build_id_criterion
+from models.mast import build as build_mast
 from runtime_option import runtime_option
 from utils.misc import yaml_to_dict, set_seed
 from configs.util import load_super_config, update_config
@@ -96,8 +95,8 @@ def train_engine(config: dict):
         "global_step": 0
     }
 
-    # Build MOTIP model:
-    model, detr_criterion = build_motip(config=config)
+    # Build MAST model:
+    model, detr_criterion = build_mast(config=config)
     # Load the pre-trained DETR:
     load_detr_pretrain(
         model=model, pretrain_path=config["DETR_PRETRAIN"], num_classes=config["NUM_CLASSES"],
@@ -106,14 +105,12 @@ def train_engine(config: dict):
     logger.success(
         log=f"Load the pre-trained DETR from '{config['DETR_PRETRAIN']}'. "
     )
-    # Build Loss Function:
-    id_criterion = build_id_criterion(config=config)
 
     # Build Optimizer:
     if config["DETR_NUM_TRAIN_FRAMES"] == 0:
         for n, p in model.named_parameters():
             if "detr" in n:
-                p.requires_grad = False     # only train the MOTIP part.
+                p.requires_grad = False     # only train the MAST part.
     param_groups = get_param_groups(model, config)
     optimizer = AdamW(
         params=param_groups,
@@ -171,7 +168,6 @@ def train_engine(config: dict):
             dataloader=train_dataloader,
             model=model,
             detr_criterion=detr_criterion,
-            id_criterion=id_criterion,
             optimizer=optimizer,
             only_detr=only_detr,
             lr_warmup_epochs=config["LR_WARMUP_EPOCHS"],
@@ -179,7 +175,7 @@ def train_engine(config: dict):
             detr_num_train_frames=config["DETR_NUM_TRAIN_FRAMES"],
             detr_num_checkpoint_frames=config["DETR_NUM_CHECKPOINT_FRAMES"],
             detr_criterion_batch_len=config.get("DETR_CRITERION_BATCH_LEN", 10),
-            use_decoder_checkpoint=config["USE_DECODER_CHECKPOINT"],
+            assign_loss_weight=config.get("ASSIGN_LOSS_WEIGHT", 1.0),
             accumulate_steps=config["ACCUMULATE_STEPS"],
             separate_clip_norm=config.get("SEPARATE_CLIP_NORM", True),
             max_clip_norm=config.get("MAX_CLIP_NORM", 0.1),
@@ -267,7 +263,6 @@ def train_one_epoch(
         dataloader: DataLoader,
         model,
         detr_criterion,
-        id_criterion,
         optimizer,
         only_detr,
         lr_warmup_epochs: int,
@@ -275,7 +270,7 @@ def train_one_epoch(
         detr_num_train_frames: int,
         detr_num_checkpoint_frames: int,
         detr_criterion_batch_len: int,
-        use_decoder_checkpoint: bool,
+        assign_loss_weight: float = 1.0,
         accumulate_steps: int = 1,
         separate_clip_norm: bool = True,
         max_clip_norm: float = 0.1,
@@ -329,132 +324,49 @@ def train_one_epoch(
             )
 
         _B, _T = len(annotations), len(annotations[0])
-        detr_num_train_frames = min(detr_num_train_frames, _T)
+        detr_num_train_frames_ = min(detr_num_train_frames, _T)
 
-        # Prepare the DETR targets from the annotations:
-        detr_targets_flatten = annotations_to_flatten_detr_targets(annotations=annotations, device=device)
+        # Which frames get gradients for the DETR backbone+encoder
+        random_frame_idxs = torch.randperm(_T, device=device)
+        detr_train_frame_idxs = set(random_frame_idxs[:detr_num_train_frames_].tolist())
 
-        # Select the training and no_grad frames:
-        random_frame_idxs = torch.randperm(_T, device=device)   # use these random indices to select the frames.
-        go_back_frame_idxs = torch.argsort(random_frame_idxs)   # use these indices to go back to the original order.
-        go_back_frame_idxs_flatten = torch.cat([
-            go_back_frame_idxs + _T * b for b in range(_B)
-        ])      # only used for the DETR's criterion.
-        # Split random_frame_idxs into training and no_grad frame indices:
-        detr_train_frame_idxs = random_frame_idxs[:detr_num_train_frames]
-        detr_no_grad_frame_idxs = random_frame_idxs[detr_num_train_frames:]
-
-        detr_outputs_flatten_idxs = torch.arange(_B * _T, device=device)
-        detr_outputs_flatten_idxs = einops.rearrange(detr_outputs_flatten_idxs, "(b t) -> b t", b=_B)
-        detr_outputs_flatten_idxs = torch.cat([
-            einops.rearrange(detr_outputs_flatten_idxs[:, :detr_num_train_frames], "b t -> (b t)"),
-            einops.rearrange(detr_outputs_flatten_idxs[:, detr_num_train_frames:], "b t -> (b t)"),
-        ], dim=0)
-        detr_outputs_flatten_go_back_idxs = torch.argsort(detr_outputs_flatten_idxs)
-        pass
-        # Select the training and no_grad frames:
-        detr_train_frames = nested_tensor_index_select(images, dim=1, index=detr_train_frame_idxs)
-        detr_no_grad_frames = nested_tensor_index_select(images, dim=1, index=detr_no_grad_frame_idxs)
-
-        # Prepare for the DETR forward function, turn the (B, T, ...) images to (B*T, ...) (or said flatten):
-        detr_train_frames.tensors = einops.rearrange(detr_train_frames.tensors, "b t c h w -> (b t) c h w").contiguous()
-        detr_train_frames.mask = einops.rearrange(detr_train_frames.mask, "b t h w -> (b t) h w").contiguous()
-        detr_no_grad_frames.tensors = einops.rearrange(detr_no_grad_frames.tensors, "b t c h w -> (b t) c h w").contiguous()
-        detr_no_grad_frames.mask = einops.rearrange(detr_no_grad_frames.mask, "b t h w -> (b t) h w").contiguous()
-
-        # TODO: For DeNoise (e.g., in DINO-DETR),
-        #       need to split the detr_targets_flatten into training and no_grad parts.
-
-        # DETR forward:
-        # 1. no_grad frames:
-        if _T > detr_num_train_frames:      # do have no_grad frames (if not, skip this part)
-            with torch.no_grad():
-                if detr_num_checkpoint_frames == 0 or detr_num_checkpoint_frames * 4 >= len(detr_no_grad_frames):
-                    # Directly forward the no_grad frames:
-                    detr_no_grad_outputs = model(frames=detr_no_grad_frames, part="detr")
-                else:
-                    # Split the no_grad frames into batched iterations (reduce the memory usage):
-                    detr_no_grad_outputs = None
-                    for batch_samples in batch_iterator(
-                        detr_num_checkpoint_frames * 4,
-                        detr_no_grad_frames,
-                    ):
-                        batch_frames = batch_samples[0]
-                        _ = model(frames=batch_frames, part="detr")
-                        detr_no_grad_outputs = tensor_dict_cat(detr_no_grad_outputs, _, dim=0)
-        else:                               # no no_grad frames
-            detr_no_grad_outputs = None
-
-        # 2. training frames:
-        if detr_num_train_frames > 0:
-            if detr_num_checkpoint_frames == 0 or detr_num_checkpoint_frames >= len(detr_train_frames):
-                # Directly forward the training frames:
-                detr_train_outputs = model(frames=detr_train_frames, part="detr")
-            else:
-                # Split the training frames into batched iterations (reduce the memory usage):
-                detr_train_outputs = None
-                for batch_samples in batch_iterator(
-                    detr_num_checkpoint_frames,
-                    detr_train_frames,
-                ):
-                    batch_frames = batch_samples[0]
-                    _ = model(frames=batch_frames, part="detr", use_checkpoint=True)
-                    detr_train_outputs = tensor_dict_cat(detr_train_outputs, _, dim=0)
-        else:
-            detr_train_outputs = None
-
-        # Combine training and no_grad outputs:
-        detr_outputs = tensor_dict_cat(detr_train_outputs, detr_no_grad_outputs, dim=0)
-        # Recover the order of the outputs:
-        detr_outputs = tensor_dict_index_select(detr_outputs, index=detr_outputs_flatten_go_back_idxs, dim=0)
-        detr_outputs = tensor_dict_index_select(detr_outputs, index=go_back_frame_idxs_flatten, dim=0)
-
-        # DETR criterion:
-        detr_loss_dict, detr_indices = detr_criterion(outputs=detr_outputs, targets=detr_targets_flatten, batch_len=detr_criterion_batch_len)
-
-        # Whether to only train the DETR, OR to train the MOTIP together:
-        if not only_detr:
-            _G, _, _N = annotations[0][0]["trajectory_id_labels"].shape
-            # Need to prepare for MOTIP:
-            seq_info = prepare_for_motip(
-                detr_outputs=detr_outputs, annotations=annotations, detr_indices=detr_indices,
+        if only_detr:
+            # ── Pretrain mode: standard DETR forward, all frames flattened ──────
+            detr_targets_flatten = annotations_to_flatten_detr_targets(
+                annotations=annotations, device=device
             )
-            seq_info = model(seq_info=seq_info, part="trajectory_modeling")
-            id_logits, id_gts, id_masks = model(
-                seq_info=seq_info,
-                part="id_decoder",
-                use_decoder_checkpoint=use_decoder_checkpoint,
-            )
-            id_loss = id_criterion(id_logits=id_logits, id_labels=id_gts, id_masks=id_masks)
-            _num_gts_per_frame = max(_num_gts_per_frame, id_gts.shape[-1])
-            # print(f"Num of GTs per frame: {_num_gts_per_frame}")
-            pass
-        else:
-            id_loss = None
+            # Flatten images (B, T, C, H, W) → (B*T, C, H, W)
+            flat_tensors = einops.rearrange(images.tensors, "b t c h w -> (b t) c h w").contiguous()
+            flat_mask = einops.rearrange(images.mask, "b t h w -> (b t) h w").contiguous()
+            flat_images = NestedTensor(flat_tensors, flat_mask)
 
-        # Backward:
-        with accelerator.autocast():
-            detr_weight_dict = detr_criterion.weight_dict
-            detr_loss = sum(
-                detr_loss_dict[k] * detr_weight_dict[k] for k in detr_loss_dict.keys() if k in detr_weight_dict
+            detr_outputs = model(flat_images)
+            detr_loss_dict, _ = detr_criterion(
+                outputs=detr_outputs, targets=detr_targets_flatten,
+                batch_len=detr_criterion_batch_len,
             )
-            loss = detr_loss + (id_loss if id_loss is not None else 0) * id_criterion.weight
-            # Logging losses:
-            metrics.update(name="loss", value=loss.item())
-            metrics.update(name="detr_loss", value=detr_loss.item())
-            if id_loss is not None:
-                metrics.update(name="id_loss", value=id_loss.item())
-            for k, v in detr_loss_dict.items():
-                metrics.update(name=k, value=v.item())
-            loss /= accumulate_steps
-            accelerator.backward(loss)  # use this line to replace loss.backward()
+
+            with accelerator.autocast():
+                detr_weight_dict = detr_criterion.weight_dict
+                loss = sum(
+                    detr_loss_dict[k] * detr_weight_dict[k]
+                    for k in detr_loss_dict if k in detr_weight_dict
+                )
+                metrics.update(name="loss", value=loss.item())
+                metrics.update(name="detr_loss", value=loss.item())
+                for k, v in detr_loss_dict.items():
+                    metrics.update(name=k, value=v.item())
+                loss /= accumulate_steps
+
+            accelerator.backward(loss)
             if (step + 1) % accumulate_steps == 0:
                 if use_accelerate_clip_norm:
                     if separate_clip_norm:
                         detr_grad_norm = accelerator.clip_grad_norm_(detr_params, max_norm=max_clip_norm)
                         other_grad_norm = accelerator.clip_grad_norm_(other_params, max_norm=max_clip_norm)
                     else:
-                        detr_grad_norm = other_grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=max_clip_norm)
+                        detr_grad_norm = other_grad_norm = accelerator.clip_grad_norm_(
+                            model.parameters(), max_norm=max_clip_norm)
                 else:
                     if separate_clip_norm:
                         accelerator.unscale_gradients()
@@ -462,8 +374,124 @@ def train_one_epoch(
                         other_grad_norm = torch.nn.utils.clip_grad_norm_(other_params, max_clip_norm)
                     else:
                         accelerator.unscale_gradients()
-                        detr_grad_norm = other_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_clip_norm)
-                # Hack implementation to log grad_norm
+                        detr_grad_norm = other_grad_norm = torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), max_clip_norm)
+                metrics.update(name="detr_grad_norm", value=detr_grad_norm.item())
+                metrics.update(name="other_grad_norm", value=other_grad_norm.item())
+                optimizer.step()
+                optimizer.zero_grad()
+
+        else:
+            # ── Tracking mode: frame-by-frame MAST loop ──────────────────────────
+            # Phase 1: Run backbone+encoder for all T frames
+            model_unwrapped = get_model(model)
+            all_encoder_outputs = []
+            for t in range(_T):
+                frame_tensors = images.tensors[:, t].contiguous()   # [B, C, H, W]
+                frame_mask = images.mask[:, t].contiguous()          # [B, H, W]
+                frame_nt = NestedTensor(frame_tensors, frame_mask)
+                if t in detr_train_frame_idxs:
+                    enc_out = model_unwrapped.forward_encoder(frame_nt)
+                else:
+                    with torch.no_grad():
+                        enc_out = model_unwrapped.forward_encoder(frame_nt)
+                all_encoder_outputs.append(enc_out)
+
+            # Phase 2: Frame-by-frame MAST decoder + losses
+            track_queries = None        # [B, N_track, d_model] or None
+            track_spatial_info = None   # [B, N_track, d_model] or None
+            track_gt_ids = None         # list of lists: [[id, ...], ...] per batch
+
+            total_detect_loss = torch.tensor(0.0, device=device)
+            total_assign_loss = torch.tensor(0.0, device=device)
+            num_assign_frames = 0
+
+            for t in range(_T):
+                detr_targets_t = [
+                    {
+                        "boxes": annotations[b][t]["bbox"].to(device),
+                        "labels": annotations[b][t]["category"].to(device),
+                    }
+                    for b in range(_B)
+                ]
+
+                mast_out = model_unwrapped.forward_decoder(
+                    encoder_output=all_encoder_outputs[t],
+                    track_queries=track_queries,
+                    track_spatial_info=track_spatial_info,
+                )
+
+                detect_loss_dict, hungarian_indices_t = detr_criterion(
+                    outputs=mast_out, targets=detr_targets_t,
+                    batch_len=detr_criterion_batch_len,
+                )
+                detr_weight_dict = detr_criterion.weight_dict
+                detect_loss_t = sum(
+                    detect_loss_dict[k] * detr_weight_dict[k]
+                    for k in detect_loss_dict if k in detr_weight_dict
+                )
+                total_detect_loss = total_detect_loss + detect_loss_t
+
+                # Assignment loss (frame 2 onward)
+                if track_queries is not None and track_queries.shape[1] > 0:
+                    gt_assignment = build_gt_assignment(
+                        track_gt_ids=track_gt_ids,
+                        hungarian_indices=hungarian_indices_t,
+                        annotations_t=[annotations[b][t] for b in range(_B)],
+                        num_detect=model_unwrapped.num_queries,
+                        device=device,
+                    )
+                    assignment_logits = mast_out["assignment_logits"]  # [B, N_track, N_detect+1]
+                    assign_loss_t = F.cross_entropy(
+                        assignment_logits.reshape(-1, assignment_logits.shape[-1]),
+                        gt_assignment.reshape(-1),
+                        reduction='mean',
+                    )
+                    total_assign_loss = total_assign_loss + assign_loss_t
+                    num_assign_frames += 1
+                else:
+                    gt_assignment = None
+
+                # Teacher forcing update for next frame
+                track_queries, track_spatial_info, track_gt_ids = teacher_forcing_update(
+                    model=model_unwrapped,
+                    mast_out=mast_out,
+                    gt_assignment=gt_assignment,
+                    hungarian_indices=hungarian_indices_t,
+                    annotations_t=[annotations[b][t] for b in range(_B)],
+                    prev_track_queries=track_queries,
+                    prev_track_gt_ids=track_gt_ids,
+                    device=device,
+                )
+
+            detect_loss = total_detect_loss / _T
+            assign_loss = total_assign_loss / max(num_assign_frames, 1)
+            loss = detect_loss + assign_loss_weight * assign_loss
+
+            with accelerator.autocast():
+                metrics.update(name="loss", value=loss.item())
+                metrics.update(name="detr_loss", value=detect_loss.item())
+                metrics.update(name="assign_loss", value=assign_loss.item())
+                loss /= accumulate_steps
+
+            accelerator.backward(loss)
+            if (step + 1) % accumulate_steps == 0:
+                if use_accelerate_clip_norm:
+                    if separate_clip_norm:
+                        detr_grad_norm = accelerator.clip_grad_norm_(detr_params, max_norm=max_clip_norm)
+                        other_grad_norm = accelerator.clip_grad_norm_(other_params, max_norm=max_clip_norm)
+                    else:
+                        detr_grad_norm = other_grad_norm = accelerator.clip_grad_norm_(
+                            model.parameters(), max_norm=max_clip_norm)
+                else:
+                    if separate_clip_norm:
+                        accelerator.unscale_gradients()
+                        detr_grad_norm = torch.nn.utils.clip_grad_norm_(detr_params, max_clip_norm)
+                        other_grad_norm = torch.nn.utils.clip_grad_norm_(other_params, max_clip_norm)
+                    else:
+                        accelerator.unscale_gradients()
+                        detr_grad_norm = other_grad_norm = torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), max_clip_norm)
                 metrics.update(name="detr_grad_norm", value=detr_grad_norm.item())
                 metrics.update(name="other_grad_norm", value=other_grad_norm.item())
                 optimizer.step()
@@ -598,6 +626,164 @@ def annotations_to_flatten_detr_targets(annotations: list, device):
     return targets
 
 
+def build_gt_assignment(track_gt_ids, hungarian_indices, annotations_t, num_detect, device):
+    """
+    Build GT assignment labels for cross-entropy loss on the assignment head.
+
+    Args:
+        track_gt_ids:     list of B lists, each containing int IDs for that batch's track queries
+        hungarian_indices: list of B tuples (pred_idx tensor, gt_idx tensor) from Hungarian matching
+        annotations_t:    list of B annotation dicts for the current frame (has 'id' field)
+        num_detect:       number of detect queries (= dustbin index)
+        device:           torch device
+
+    Returns:
+        gt_assignment: [B, N_track] long tensor, values in [0, num_detect]
+                       (num_detect = dustbin = no matching detect query)
+    """
+    B = len(track_gt_ids)
+    N_track = max(len(ids) for ids in track_gt_ids) if B > 0 else 0
+    gt_assignment = torch.full((B, N_track), num_detect, dtype=torch.long, device=device)
+
+    for b in range(B):
+        pred_indices, gt_indices = hungarian_indices[b]
+        frame_ids = annotations_t[b]["id"].to(device)   # [N_gt] — GT IDs in this frame
+
+        # Build map: GT identity → detect query index
+        gt_id_to_detect_idx = {}
+        for pred_idx, gt_idx in zip(pred_indices.tolist(), gt_indices.tolist()):
+            if gt_idx < len(frame_ids):
+                gt_identity = frame_ids[gt_idx].item()
+                gt_id_to_detect_idx[gt_identity] = pred_idx
+
+        for i, track_identity in enumerate(track_gt_ids[b]):
+            if track_identity in gt_id_to_detect_idx:
+                gt_assignment[b, i] = gt_id_to_detect_idx[track_identity]
+            # else: stays as dustbin
+
+    return gt_assignment
+
+
+def teacher_forcing_update(
+        model, mast_out, gt_assignment, hungarian_indices, annotations_t,
+        prev_track_queries, prev_track_gt_ids, device,
+):
+    """
+    Update track queries using GT assignment (teacher forcing).
+
+    Updates existing tracks via TIA for matched ones; freezes dustbin-assigned tracks;
+    creates new track queries via InitMLP for newly appeared targets.
+
+    Args:
+        model:              MAST model (unwrapped, has .tia and .init_mlp)
+        mast_out:           output dict from forward_decoder()
+        gt_assignment:      [B, N_track] or None
+        hungarian_indices:  list of B tuples (pred_idx, gt_idx) from this frame's matching
+        annotations_t:      list of B annotation dicts for this frame
+        prev_track_queries: [B, N_track, d_model] or None
+        prev_track_gt_ids:  list of B lists of ints, or None
+        device:             torch device
+
+    Returns:
+        new_track_queries:  [B, N_track_new, d_model]
+        new_spatial_info:   [B, N_track_new, d_model]
+        new_track_gt_ids:   list of B lists of ints
+    """
+    from models.misc import pos_to_pos_embed
+
+    B = mast_out["detect_outputs"].shape[0]
+    d_model = mast_out["detect_outputs"].shape[-1]
+    num_detect = model.num_queries
+
+    all_tq = []
+    all_si = []
+    all_ids = []
+
+    for b in range(B):
+        detect_out_b = mast_out["detect_outputs"][b]   # [N_detect, d_model]
+        pred_boxes_b = mast_out["pred_boxes"][b]        # [N_detect, 4]
+
+        updated_tq = []
+        updated_si = []
+        updated_ids = []
+
+        # Part 1: update existing track queries
+        if prev_track_queries is not None and gt_assignment is not None:
+            track_out_b = mast_out["track_outputs"][b]          # [N_track, d_model]
+            assign_logits_b = mast_out["assignment_logits"][b]  # [N_track, N_detect+1]
+
+            for i in range(prev_track_queries.shape[1]):
+                gt_idx = gt_assignment[b, i].item()
+                tq_i = prev_track_queries[b, i]   # [d_model]
+
+                if gt_idx == num_detect:
+                    # Dustbin: keep previous track query unchanged
+                    updated_tq.append(tq_i)
+                    # Reuse previous spatial info (approximate with zeros if unavailable)
+                    updated_si.append(torch.zeros(d_model, device=device))
+                    updated_ids.append(prev_track_gt_ids[b][i])
+                else:
+                    # Matched: use TIA to update
+                    confidence = assign_logits_b[i, gt_idx].sigmoid().unsqueeze(0)  # [1]
+                    matched_detect = detect_out_b[gt_idx].unsqueeze(0)              # [1, d_model]
+                    track_q = track_out_b[i].unsqueeze(0)                           # [1, d_model]
+                    updated_track = model.tia(
+                        track_query=track_q,
+                        matched_detect=matched_detect,
+                        confidence=confidence,
+                    ).squeeze(0)   # [d_model]
+                    updated_tq.append(updated_track)
+                    # Spatial info from matched detect bbox center (detached)
+                    bbox_center = pred_boxes_b[gt_idx, :2].detach()  # [2] cx, cy
+                    si = pos_to_pos_embed(
+                        bbox_center.unsqueeze(0), num_pos_feats=d_model // 2
+                    ).squeeze(0)   # [d_model]
+                    updated_si.append(si)
+                    updated_ids.append(prev_track_gt_ids[b][i])
+
+        # Part 2: new track queries for newly appeared targets
+        existing_ids = set(updated_ids)
+        pred_indices, gt_indices = hungarian_indices[b]
+        frame_ids = annotations_t[b]["id"].to(device)  # [N_gt]
+
+        for pred_idx, gt_idx in zip(pred_indices.tolist(), gt_indices.tolist()):
+            if gt_idx >= len(frame_ids):
+                continue
+            gt_identity = frame_ids[gt_idx].item()
+            if gt_identity not in existing_ids:
+                new_tq = model.init_mlp(
+                    detect_out_b[pred_idx].unsqueeze(0)
+                ).squeeze(0)   # [d_model]
+                bbox_center = pred_boxes_b[pred_idx, :2].detach()
+                new_si = pos_to_pos_embed(
+                    bbox_center.unsqueeze(0), num_pos_feats=d_model // 2
+                ).squeeze(0)
+                updated_tq.append(new_tq)
+                updated_si.append(new_si)
+                updated_ids.append(gt_identity)
+                existing_ids.add(gt_identity)
+
+        all_tq.append(updated_tq)
+        all_si.append(updated_si)
+        all_ids.append(updated_ids)
+
+    # Pad across batch
+    max_tracks = max((len(tq) for tq in all_tq), default=0)
+    if max_tracks == 0:
+        return None, None, None
+
+    tq_padded = torch.zeros(B, max_tracks, d_model, device=device)
+    si_padded = torch.zeros(B, max_tracks, d_model, device=device)
+
+    for b in range(B):
+        n = len(all_tq[b])
+        if n > 0:
+            tq_padded[b, :n] = torch.stack(all_tq[b])
+            si_padded[b, :n] = torch.stack(all_si[b])
+
+    return tq_padded, si_padded, all_ids
+
+
 def nested_tensor_index_select(nested_tensor: NestedTensor, dim: int, index: torch.Tensor):
     tensors, mask = nested_tensor.decompose()
     _device = tensors.device
@@ -627,63 +813,6 @@ def tensor_dict_cat(tensor_dict1, tensor_dict2, dim=0):
             else:
                 raise ValueError(f"Unsupported type {type(tensor_dict1[k])} in the tensor dict concat.")
         return dict(res_tensor_dict)
-
-
-
-def prepare_for_motip(detr_outputs, annotations, detr_indices):
-    _B, _T = len(annotations), len(annotations[0])
-    _G, _, _N = annotations[0][0]["trajectory_id_labels"].shape
-    _device = detr_outputs["pred_logits"].device
-    _feature_dim = detr_outputs["outputs"].shape[-1]
-    # Init corresponding variables:
-    trajectory_id_labels = - torch.ones((_B, _G, _T, _N), dtype=torch.int64, device=_device)
-    trajectory_times = - torch.ones((_B, _G, _T, _N), dtype=torch.int64, device=_device)
-    trajectory_masks = torch.ones((_B, _G, _T, _N), dtype=torch.bool, device=_device)
-    trajectory_boxes = torch.zeros((_B, _G, _T, _N, 4), dtype=torch.float32, device=_device)
-    trajectory_features = torch.zeros((_B, _G, _T, _N, _feature_dim), dtype=torch.float32, device=_device)
-    unknown_id_labels = - torch.ones((_B, _G, _T, _N), dtype=torch.int64, device=_device)
-    unknown_times = - torch.ones((_B, _G, _T, _N), dtype=torch.int64, device=_device)
-    unknown_masks = torch.ones((_B, _G, _T, _N), dtype=torch.bool, device=_device)
-    unknown_boxes = torch.zeros((_B, _G, _T, _N, 4), dtype=torch.float32, device=_device)
-    unknown_features = torch.zeros((_B, _G, _T, _N, _feature_dim), dtype=torch.float32, device=_device)
-    for b in range(_B):
-        for t in range(_T):
-            flatten_idx = b * _T + t
-            go_back_detr_idxs = torch.argsort(detr_indices[flatten_idx][1])
-            detr_output_embeds = detr_outputs["outputs"][flatten_idx][detr_indices[flatten_idx][0][go_back_detr_idxs]]
-            detr_boxes = detr_outputs["pred_boxes"][flatten_idx][detr_indices[flatten_idx][0][go_back_detr_idxs]]
-            # detr_output_embeds = einops.repeat(detr_output_embeds, "n d -> g n d", g=_G)
-            # detr_boxes = einops.repeat(detr_boxes, "n d -> g n d", g=_G)
-            for group in range(_G):
-                _curr_traj_ann_idxs = annotations[b][t]["trajectory_ann_idxs"][group, 0, :]
-                _curr_unk_ann_idxs = annotations[b][t]["unknown_ann_idxs"][group, 0, :]
-                _curr_traj_masks = annotations[b][t]["trajectory_id_masks"][group, 0, :]
-                _curr_unk_masks = annotations[b][t]["unknown_id_masks"][group, 0, :]
-                # Fill the fields:
-                trajectory_id_labels[b, group, t] = annotations[b][t]["trajectory_id_labels"][group, 0, :]
-                unknown_id_labels[b, group, t] = annotations[b][t]["unknown_id_labels"][group, 0, :]
-                trajectory_times[b, group, t] = annotations[b][t]["trajectory_times"][group, 0, :]
-                unknown_times[b, group, t] = annotations[b][t]["unknown_times"][group, 0, :]
-                trajectory_masks[b, group, t] = _curr_traj_masks
-                unknown_masks[b, group, t] = _curr_unk_masks
-                trajectory_features[b, group, t, ~_curr_traj_masks] = detr_output_embeds[_curr_traj_ann_idxs[~_curr_traj_masks]]
-                unknown_features[b, group, t, ~_curr_unk_masks] = detr_output_embeds[_curr_unk_ann_idxs[~_curr_unk_masks]]
-                trajectory_boxes[b, group, t, ~_curr_traj_masks] = detr_boxes[_curr_traj_ann_idxs[~_curr_traj_masks]]
-                unknown_boxes[b, group, t, ~_curr_unk_masks] = detr_boxes[_curr_unk_ann_idxs[~_curr_unk_masks]]
-                pass
-            pass
-    return {
-        "trajectory_id_labels": trajectory_id_labels,
-        "trajectory_times": trajectory_times,
-        "trajectory_masks": trajectory_masks,
-        "trajectory_boxes": trajectory_boxes,
-        "trajectory_features": trajectory_features,
-        "unknown_id_labels": unknown_id_labels,
-        "unknown_times": unknown_times,
-        "unknown_masks": unknown_masks,
-        "unknown_boxes": unknown_boxes,
-        "unknown_features": unknown_features,
-    }
 
 
 if __name__ == '__main__':

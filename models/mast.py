@@ -308,6 +308,101 @@ class MAST(nn.Module):
 
         return out
 
+    def forward_encoder(self, samples):
+        """
+        Run backbone + encoder only. Returns encoder state for forward_decoder().
+
+        Args:
+            samples: NestedTensor [B, 3, H, W]
+        Returns:
+            dict with keys: memory, mask_flatten, spatial_shapes,
+                            level_start_index, valid_ratios, pos_flat
+        """
+        if not isinstance(samples, NestedTensor):
+            samples = nested_tensor_from_tensor_list(samples)
+
+        features, pos = self.detr.backbone(samples)
+        srcs, masks, pos = self._build_srcs_masks_pos(features, samples, pos)
+
+        transformer = self.detr.transformer
+        src_flat, mask_flat, lvl_pos_flat, spatial_shapes, lvl_start_idx, valid_ratios = \
+            transformer.prepare_encoder_input(srcs, masks, pos)
+
+        memory = transformer.encoder(
+            src_flat, spatial_shapes, lvl_start_idx, valid_ratios,
+            lvl_pos_flat, mask_flat,
+        )
+        return {
+            "memory": memory,
+            "mask_flatten": mask_flat,
+            "spatial_shapes": spatial_shapes,
+            "level_start_index": lvl_start_idx,
+            "valid_ratios": valid_ratios,
+        }
+
+    def forward_decoder(self, encoder_output, track_queries=None, track_spatial_info=None):
+        """
+        Run MAST decoder + detection/assignment heads on one frame,
+        using pre-computed encoder output from forward_encoder().
+
+        Args:
+            encoder_output:     dict from forward_encoder()
+            track_queries:      [B, N_track, d_model] or None
+            track_spatial_info: [B, N_track, d_model] or None
+        Returns:
+            Same dict as forward()
+        """
+        memory = encoder_output["memory"]
+        mask_flat = encoder_output["mask_flatten"]
+        spatial_shapes = encoder_output["spatial_shapes"]
+        lvl_start_idx = encoder_output["level_start_index"]
+        valid_ratios = encoder_output["valid_ratios"]
+        bs = memory.shape[0]
+
+        transformer = self.detr.transformer
+        q_embed = self.detr.query_embed.weight
+        query_pos, tgt = torch.split(q_embed, self.d_model, dim=1)
+        query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
+        tgt = tgt.unsqueeze(0).expand(bs, -1, -1)
+        reference_points = transformer.reference_points(query_pos).sigmoid()
+        init_reference = reference_points
+
+        if self.only_detr:
+            hs, inter_references = transformer.decoder(
+                tgt, reference_points, memory,
+                spatial_shapes, lvl_start_idx, valid_ratios,
+                query_pos, mask_flat,
+            )
+            out = self._compute_detections(hs, init_reference, inter_references)
+            out["detect_outputs"] = hs[-1]
+            out["outputs"] = hs[-1]
+            out["track_outputs"] = None
+            out["assignment_logits"] = None
+        else:
+            detect_hs, track_output, inter_references = self.mast_decoder(
+                detect_queries=tgt,
+                track_queries=track_queries,
+                detect_pos=query_pos,
+                track_spatial_info=track_spatial_info,
+                reference_points=reference_points,
+                src=memory,
+                src_spatial_shapes=spatial_shapes,
+                src_level_start_index=lvl_start_idx,
+                src_valid_ratios=valid_ratios,
+                src_padding_mask=mask_flat,
+            )
+            out = self._compute_detections(detect_hs, init_reference, inter_references)
+            out["detect_outputs"] = detect_hs[-1]
+            out["outputs"] = detect_hs[-1]
+            out["track_outputs"] = track_output
+
+            if track_queries is not None and track_queries.shape[1] > 0:
+                out["assignment_logits"] = self.assignment_head(track_output, detect_hs[-1])
+            else:
+                out["assignment_logits"] = None
+
+        return out
+
 
 # ─── Build ────────────────────────────────────────────────────────────────────
 
