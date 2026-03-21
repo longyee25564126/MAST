@@ -1,0 +1,37 @@
+# Root gitignore file
+
+# PyCharm
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# Build
+build/
+dist/
+
+# Model weights & large files
+*.pth
+*.pt
+*.bin
+*.ckpt
+*.pkl
+*.h5
+
+# Claude
+.claude/
+
+# Outputs / logs
+outputs/
+log/*.log
+
+# Data
+data/dancetrack/
+data/sportsmot/
+data/bft/
+data/crowdhuman/
